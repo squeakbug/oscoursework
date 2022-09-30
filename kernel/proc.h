@@ -93,6 +93,11 @@ struct proc {
   int pid;                     // Process ID
 
   int priority;                // Process dynamic prioriry
+  uint ctime;                  // Process creation time
+  int stime;                   // Process SLEEPING time
+  int retime;                  // Process READY(RUNNABLE) time
+  int rutime;                  // Process RUNNING time
+  int tickcounter;             // Counter of ticks clock
 
   // wait_lock must be held when using this:
   struct proc *parent;         // Parent process

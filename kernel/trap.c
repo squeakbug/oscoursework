@@ -165,6 +165,7 @@ clockintr()
 {
   acquire(&tickslock);
   ticks++;
+  update_statistics();
   wakeup(&ticks);
   release(&tickslock);
 }

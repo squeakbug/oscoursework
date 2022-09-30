@@ -444,7 +444,7 @@ wait(uint64 addr)
 void
 scheduler(void)
 {
-  struct proc *p, *high_p, *pi;
+  struct proc *p;
   struct cpu *c = mycpu();
   
   c->proc = 0;
@@ -452,25 +452,22 @@ scheduler(void)
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
 
-    for(p = proc; p < &proc[NPROC]; p++) {
+    //p = ready_process();
+    for (p = proc; p < &proc[NPROC]; p++)
+    {
       acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        high_p = p;
-        for(pi = p; pi < &proc[NPROC]; pi++){
-          if((pi->state == RUNNABLE) && (high_p->priority > pi->priority))   
-            high_p = pi;
-        }
-        for(pi = proc; pi < p; pi++){
-          if((pi->state == RUNNABLE) && (high_p->priority > pi->priority))   
-            high_p = pi;
-        }
-        p = high_p;
-
+      if (p->state == RUNNABLE)
+      {
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        #ifdef DML
+        p->tickcounter = 0;
+        #endif
+
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
@@ -720,3 +717,173 @@ int getpriority(int pid)
   }
   return -1;
 }
+
+// Run every clock tick and update the statistic fields of each process
+void update_statistics()
+{
+  struct proc *p;
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    switch(p->state) {
+      case SLEEPING:
+        p->stime++;
+        break;
+      case RUNNABLE:
+        p->retime++;
+        break;
+      case RUNNING:
+        p->rutime++;
+        break;
+      default:
+        ;
+    }
+    release(&p->lock);
+  }
+}
+
+#ifdef DEFAULT
+// Find the next process process to run
+struct proc *ready_process()
+{
+  static struct proc *p = proc;
+  struct proc *pcandidate = 0;
+
+  for(; pcandidate == 0 && p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->state == RUNNABLE)
+      pcandidate = p;
+    release(&p->lock);
+  }
+
+  if (p == &proc[NPROC])
+    p = proc;
+
+  return pcandidate;
+}
+#endif
+
+#ifdef PRIORITY
+// Find the next process process to run
+struct proc *ready_process()
+{
+  struct proc *p, *pcandidate = 0;
+  
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->state == RUNNABLE){
+      if(pcandidate == 0){
+        pcandidate = p;
+      }else if (p->priority < pcandidate->priority){
+        pcandidate = p;
+      }
+    }
+    release(&p->lock);
+  }
+  return pcandidate; 
+}
+#endif
+
+#ifdef FCFS
+// Find the next process process to run
+struct proc *ready_process()
+{
+  struct proc *p, *pcandidate = 0;
+  
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->state == RUNNABLE){
+      if(pcandidate == 0){
+        pcandidate = p;
+      }else if (p->ctime < pcandidate->ctime){
+        pcandidate = p;
+      }
+    }
+    release(&p->lock);
+  }
+  return pcandidate; 
+}
+#endif
+
+#ifdef CFS
+// Find the next process process to run
+struct proc *ready_process()
+{
+  struct proc *p, *pcandidate = 0;
+  
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->state == RUNNABLE){
+      if(pcandidate == 0){
+        pcandidate = p;
+      }else if (p->rutime < pcandidate->rutime){
+        pcandidate = p;
+      }
+    }
+    release(&p->lock);
+  }
+  return pcandidate; 
+}
+#endif
+
+#ifdef SML
+// Find the next process process to run
+struct proc *ready_process()
+{
+  struct proc *p_i, **pp_i; 
+  struct proc *high_queue[NPROC], *mid_queue[NPROC], *low_queue[NPROC];
+  int high_index = 0, mid_index = 0, low_index = 0;
+  
+  for(p_i = proc; p_i < &proc[NPROC]; p_i++){
+    if(p_i->state != RUNNABLE) continue;
+
+    if(p_i->priority <= 7){
+      high_queue[high_index++] = p_i;
+    }else if (p_i->priority > 7 && p_i->priority <= 14){
+      mid_queue[mid_index++] = p_i;
+    }else{
+      low_queue[low_index++] = p_i;
+    }
+  }
+
+  if(high_index > 0){
+    return high_queue[random(high_index)];
+  }else if (mid_index > 0){
+    return mid_queue[random(mid_index)];
+  }else if (low_index > 0){
+    return low_queue[random(low_index)];
+  }
+
+  return 0;
+}
+#endif
+
+#ifdef DML
+// Find the next process process to run
+struct proc *ready_process() {
+  struct proc *p_i, **pp_i; 
+  struct proc *high_queue[NPROC], *mid_queue[NPROC], *low_queue[NPROC];
+  int high_index = 0, mid_index = 0, low_index = 0;
+  
+  for(p_i = proc; p_i < &proc[NPROC]; p_i++){
+    if(p_i->state != RUNNABLE) continue;
+
+    if(p_i->priority <= 7){
+      high_queue[high_index++] = p_i;
+    }else if (p_i->priority > 7 && p_i->priority <= 14){
+      mid_queue[mid_index++] = p_i;
+    }else{
+      low_queue[low_index++] = p_i;
+    }
+  }
+
+  if(high_index > 0){
+    return high_queue[random(high_index)];
+  }else if (mid_index > 0){
+    return mid_queue[random(mid_index)];
+  }else if (low_index > 0){
+    return low_queue[random(low_index)];
+  }
+
+  return 0;
+}
+#endif
