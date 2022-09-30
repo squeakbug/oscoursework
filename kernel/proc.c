@@ -444,7 +444,7 @@ wait(uint64 addr)
 void
 scheduler(void)
 {
-  struct proc *p;
+  struct proc *p, *high_p, *pi;
   struct cpu *c = mycpu();
   
   c->proc = 0;
@@ -455,6 +455,17 @@ scheduler(void)
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
       if(p->state == RUNNABLE) {
+        high_p = p;
+        for(pi = p; pi < &proc[NPROC]; pi++){
+          if((pi->state == RUNNABLE) && (high_p->priority > pi->priority))   
+            high_p = pi;
+        }
+        for(pi = proc; pi < p; pi++){
+          if((pi->state == RUNNABLE) && (high_p->priority > pi->priority))   
+            high_p = pi;
+        }
+        p = high_p;
+
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
@@ -680,4 +691,32 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+int setpriority(int pid, int priority)
+{
+  struct proc *p;
+  int is_finded = 0;
+
+  for(p = proc; is_finded == 0 && p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->pid == pid) {
+      p->priority = priority;
+      is_finded = 1;
+    }
+    release(&p->lock);
+  }
+  return is_finded - 1;
+}
+
+int getpriority(int pid)
+{
+  struct proc *p;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    if(p->pid == pid) {
+      return p->priority;
+    }
+  }
+  return -1;
 }

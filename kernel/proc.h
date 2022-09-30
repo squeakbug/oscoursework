@@ -92,6 +92,8 @@ struct proc {
   int xstate;                  // Exit status to be returned to parent's wait
   int pid;                     // Process ID
 
+  int priority;                // Process dynamic prioriry
+
   // wait_lock must be held when using this:
   struct proc *parent;         // Parent process
 
@@ -104,4 +106,13 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+};
+
+struct procps_status {
+  uint sz;                     // Size of process memory (bytes)
+  enum procstate state;        // Process state
+  int pid;                     // Process ID
+  int ppid ;                   // Parent process ID
+  int priority;                // Process priority
+  char name[16];               // Process name 
 };
