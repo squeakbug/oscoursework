@@ -92,12 +92,11 @@ struct proc {
   int xstate;                  // Exit status to be returned to parent's wait
   int pid;                     // Process ID
 
-  int priority;                // Process dynamic prioriry
-  uint ctime;                  // Process creation time
-  int stime;                   // Process SLEEPING time
-  int retime;                  // Process READY(RUNNABLE) time
-  int rutime;                  // Process RUNNING time
-  int tickcounter;             // Counter of ticks clock
+  uint sleep_avg;              // Average sleep time
+  uint time_slice;             // Time to quantum expiration
+  int priority;                // Dynamic prioriry
+  int static_priority;         // Static priotiry
+  int ncicle;                  // Counter of resheduling
 
   // wait_lock must be held when using this:
   struct proc *parent;         // Parent process
@@ -121,3 +120,54 @@ struct procps_status {
   int priority;                // Process priority
   char name[16];               // Process name 
 };
+
+#ifndef MAX_PRIO
+#define MAX_PRIO 40
+#endif
+
+#ifndef NULL
+#define NULL  ((void *) 0)
+#endif
+
+#ifndef MAX
+# define MAX(a, b)	(((a) > (b))? (a) : (b))
+#endif
+
+#ifndef MIN
+#define MIN(a,b) ((a)<(b) ? (a):(b))
+#endif
+
+struct priority_queue {
+	struct priority_queue *next;
+	int last;                     // index of last process in the queue
+	int pos;                      // index of current process
+	struct proc *procs[NPROC];
+	int priority;                 // priority attached to queue
+};
+
+
+struct rq {
+	char bitmap[MAX_PRIO];
+	struct priority_queue queue[MAX_PRIO][1];
+	struct priority_queue *actual_queue;
+};
+
+// See https://elixir.bootlin.com/linux/v2.6.21/source/kernel/timer.c#L1206
+void update_process_times(int user_tick);
+void scheduler_tick(void);
+
+int proc_effective_priority(struct proc *proc);
+uint proc_timeslice(struct proc *proc);
+int proc_interactive(struct proc *proc);
+
+struct rq* rq_init(struct rq *queue);
+int rq_insert_runnable(struct proc *proc, struct rq *rq);
+int rq_insert_active(struct proc *proc);
+int rq_insert_expired(struct proc *proc);
+int rq_exchange();
+struct proc* rq_get_next();
+
+int priority_queue_init(struct priority_queue *queue, int priority);
+struct priority_queue* priority_queue_get(struct rq *rq,	int priority);
+int priotiry_queue_add_proc(struct proc *proc, struct priority_queue *queue);
+int priority_queue_set_next();

@@ -26,6 +26,11 @@ extern char trampoline[]; // trampoline.S
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
 
+struct spinlock rq_lock;
+struct rq *expired, *active;
+struct rq expired_d, active_d;
+
+
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
 // guard page.
@@ -56,6 +61,14 @@ procinit(void)
       p->state = UNUSED;
       p->kstack = KSTACK((int) (p - proc));
   }
+
+  #ifdef SCHED_MQS
+  initlock(&rq_lock, "rq_lock");
+  active = &active_d;
+  rq_init(active);
+  expired = &expired_d;
+  rq_init(expired);
+  #endif
 }
 
 // Must be called with interrupts disabled,
@@ -124,6 +137,12 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+
+  p->sleep_avg = 0;
+  p->time_slice = 5;
+  p->priority = 10;
+  p->static_priority = 10;
+	p->ncicle = 0;
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -251,6 +270,10 @@ userinit(void)
 
   p->state = RUNNABLE;
 
+  #ifdef SCHED_MQS
+  rq_insert_active(p);
+  #endif
+
   release(&p->lock);
 }
 
@@ -320,6 +343,9 @@ fork(void)
 
   acquire(&np->lock);
   np->state = RUNNABLE;
+  #ifdef SCHED_MQS
+  rq_insert_active(np);
+  #endif
   release(&np->lock);
 
   return pid;
@@ -441,18 +467,18 @@ wait(uint64 addr)
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
+#ifdef SCHED_DEFAULT
 void
 scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
-  
+
   c->proc = 0;
   for(;;){
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
 
-    //p = ready_process();
     for (p = proc; p < &proc[NPROC]; p++)
     {
       acquire(&p->lock);
@@ -464,10 +490,6 @@ scheduler(void)
         p->state = RUNNING;
         c->proc = p;
 
-        #ifdef DML
-        p->tickcounter = 0;
-        #endif
-
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
@@ -478,6 +500,43 @@ scheduler(void)
     }
   }
 }
+#endif
+
+#ifdef SCHED_MQS
+void
+scheduler(void)
+{
+  struct proc *p;
+  struct cpu *c = mycpu();
+  
+  c->proc = 0;
+  for(;;){
+    // Avoid deadlock by ensuring that devices can interrupt.
+    intr_on();
+
+    p = rq_get_next();
+    if (p != NULL)
+    {
+      acquire(&p->lock);
+
+      // Switch to chosen process.  It is the process's job
+      // to release its lock and then reacquire it
+      // before jumping back to us.
+      p->state = RUNNING;
+      c->proc = p;
+
+      swtch(&c->context, &p->context);
+
+      // Process is done running for now.
+      // It should have changed its p->state before coming back.
+      c->proc = 0;
+      //acquire(&schedlock);
+      release(&p->lock);
+    }
+    //release(&schedlock);
+  }
+}
+#endif
 
 // Switch to scheduler.  Must hold only p->lock
 // and have changed proc->state. Saves and restores
@@ -513,6 +572,9 @@ yield(void)
   struct proc *p = myproc();
   acquire(&p->lock);
   p->state = RUNNABLE;
+  #ifdef SCHED_MQS
+  rq_insert_expired(p);
+  #endif  
   sched();
   release(&p->lock);
 }
@@ -581,6 +643,9 @@ wakeup(void *chan)
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
         p->state = RUNNABLE;
+        #ifdef SCHED_MQS
+        rq_insert_expired(p);
+        #endif
       }
       release(&p->lock);
     }
@@ -602,6 +667,9 @@ kill(int pid)
       if(p->state == SLEEPING){
         // Wake process from sleep().
         p->state = RUNNABLE;
+        #ifdef SCHED_MQS
+        rq_insert_expired(p);
+        #endif
       }
       release(&p->lock);
       return 0;
@@ -690,8 +758,13 @@ procdump(void)
   }
 }
 
-int setpriority(int pid, int priority)
+// Set process priority
+int
+setpriority(int pid, int priority)
 {
+  if (priority < 0 || priority > MAX_PRIO)
+    return -1;
+
   struct proc *p;
   int is_finded = 0;
 
@@ -706,7 +779,9 @@ int setpriority(int pid, int priority)
   return is_finded - 1;
 }
 
-int getpriority(int pid)
+// Get process priority
+int
+getpriority(int pid)
 {
   struct proc *p;
 
@@ -718,172 +793,227 @@ int getpriority(int pid)
   return -1;
 }
 
-// Run every clock tick and update the statistic fields of each process
-void update_statistics()
+// Initialize runqueue
+struct rq*
+rq_init(struct rq *queue)
 {
-  struct proc *p;
-  for(p = proc; p < &proc[NPROC]; p++){
-    acquire(&p->lock);
-    switch(p->state) {
-      case SLEEPING:
-        p->stime++;
-        break;
-      case RUNNABLE:
-        p->retime++;
-        break;
-      case RUNNING:
-        p->rutime++;
-        break;
-      default:
-        ;
-    }
-    release(&p->lock);
-  }
+	for (int i = 0; i < MAX_PRIO; i++) {
+		queue->bitmap[i] = 0;
+	}
+	queue->actual_queue = NULL;
+	return queue;
 }
 
-#ifdef DEFAULT
-// Find the next process process to run
-struct proc *ready_process()
+// Initialize and clean a queue
+int
+priority_queue_init(struct priority_queue *queue, int priority)
 {
-  static struct proc *p = proc;
-  struct proc *pcandidate = 0;
-
-  for(; pcandidate == 0 && p < &proc[NPROC]; p++){
-    acquire(&p->lock);
-    if(p->state == RUNNABLE)
-      pcandidate = p;
-    release(&p->lock);
-  }
-
-  if (p == &proc[NPROC])
-    p = proc;
-
-  return pcandidate;
+	queue->next = NULL;
+	queue->last = -1;
+	queue->pos = 0;
+	queue->priority = priority;
+	return 1;
 }
-#endif
 
-#ifdef PRIORITY
-// Find the next process process to run
-struct proc *ready_process()
+// Get the priority_queue of a specific priority in the
+// specified rq.
+// If it does not exists then it will be created.
+struct priority_queue*
+priority_queue_get(struct rq *rq,	int priority)
 {
-  struct proc *p, *pcandidate = 0;
+	if (rq->bitmap[priority]) {
+		return rq->queue[priority];
+	}
+
+	struct priority_queue *new = rq->queue[priority];
+	priority_queue_init(new, priority);
+
+	rq->bitmap[priority] = 1;
+
+	if (rq->actual_queue == NULL || rq->actual_queue->priority > priority) {
+		new->next = rq->actual_queue;
+		rq->actual_queue = new;
+		return new;
+	}
+	// else
+	struct priority_queue *before = rq->actual_queue;
+	for (int i = priority - 1; i >= 0; i--) {
+		if (rq->bitmap[i]) {
+			before = rq->queue[i];
+			break;
+		}
+	}
+	new->next = before->next;
+	before->next = new;
+
+	return new;
+}
+
+// Insert the proc in the specified priority_queue
+// and update info of the priority_queue
+int
+priotiry_queue_add_proc(struct proc *proc, struct priority_queue *queue)
+{
+	queue->last++;
+	queue->procs[queue->last % NPROC] = proc;
+	return 0;
+}
+
+// Inserts proc in the specified rq
+// in the right position.
+int
+rq_insert_runnable(struct proc *proc, struct rq *rq)
+{
+	if (proc->state != RUNNABLE) {
+		return -1;
+	}
+  acquire(&rq_lock);
+	int priority = proc->priority;
+	struct priority_queue *queue = priority_queue_get(rq, priority);
+
+	priotiry_queue_add_proc(proc, queue);
+  release(&rq_lock);
+	return 1;
+}
+
+// If proc is RUNNABLE the funcion inserts it in the ACTIVE queue of processes
+// proc: process to be inserted in the 'queue' of execution
+//
+// Returns: 1 if succesfully inserted, otherwise -1
+// ***: This function should be called only at the creation of a proces
+int
+rq_insert_active(struct proc *proc)
+{
+	return rq_insert_runnable(proc, active);
+}
+
+//  As insertActive, but it inserts proc in ACTIVE or EXPIRED queue.
+//
+// ***: In this function it could be implemented a policy
+// of re-insertion of proc   in ACTIVE queue in spite of EXPIRED one.
+// Inserting in ACTIVE means to give more exec time to a process.
+int
+rq_insert_expired(struct proc* proc)
+{
   
-  for(p = proc; p < &proc[NPROC]; p++){
-    acquire(&p->lock);
-    if(p->state == RUNNABLE){
-      if(pcandidate == 0){
-        pcandidate = p;
-      }else if (p->priority < pcandidate->priority){
-        pcandidate = p;
-      }
-    }
-    release(&p->lock);
-  }
-  return pcandidate; 
+	/* My default policy is to reinstert a proces in ACTIVE
+	 * 1 time over the priority(+1) of the process
+	 * priority == 1  --> reinsert 1 time in 2
+ 	 * priority == 10 -->  reinsert 1 time in 11
+	 */
+	int cicle = (proc->ncicle)++;
+	if ((cicle % (proc->priority + 1)) == 0)
+		return rq_insert_runnable(proc, active);
+	return rq_insert_runnable(proc, expired);
 }
-#endif
 
-#ifdef FCFS
-// Find the next process process to run
-struct proc *ready_process()
+// Exchange active container with expired
+int
+rq_exchange()
 {
-  struct proc *p, *pcandidate = 0;
-  
-  for(p = proc; p < &proc[NPROC]; p++){
-    acquire(&p->lock);
-    if(p->state == RUNNABLE){
-      if(pcandidate == 0){
-        pcandidate = p;
-      }else if (p->ctime < pcandidate->ctime){
-        pcandidate = p;
-      }
-    }
-    release(&p->lock);
-  }
-  return pcandidate; 
+	struct rq *tmp = expired;
+	expired = active;
+	active = tmp;
+	return 0;
 }
-#endif
 
-#ifdef CFS
-// Find the next process process to run
-struct proc *ready_process()
+// Move actual_queue of ACTIVE container to the next priority_queue
+// setting all the necessary
+int
+priority_queue_set_next()
 {
-  struct proc *p, *pcandidate = 0;
-  
-  for(p = proc; p < &proc[NPROC]; p++){
-    acquire(&p->lock);
-    if(p->state == RUNNABLE){
-      if(pcandidate == 0){
-        pcandidate = p;
-      }else if (p->rutime < pcandidate->rutime){
-        pcandidate = p;
-      }
-    }
-    release(&p->lock);
-  }
-  return pcandidate; 
-}
-#endif
+	struct priority_queue* queue = active->actual_queue;
+	struct priority_queue* next = queue->next;
+	int priority = active->actual_queue->priority;
+	active->bitmap[priority] = 0;
 
-#ifdef SML
-// Find the next process process to run
-struct proc *ready_process()
+	active->actual_queue = next;
+	if (next != NULL) {
+		return 0;
+	} else {
+		return rq_exchange();
+	}
+}
+
+// Find and returns the process that belongs to the queue
+// with the lowest priority among the valid ones
+// and that has been inserted before all processes
+// not yet extracted from its priority_queue.
+// If needed it exchange rq
+struct proc *
+rq_get_next()
 {
-  struct proc *p_i, **pp_i; 
-  struct proc *high_queue[NPROC], *mid_queue[NPROC], *low_queue[NPROC];
-  int high_index = 0, mid_index = 0, low_index = 0;
-  
-  for(p_i = proc; p_i < &proc[NPROC]; p_i++){
-    if(p_i->state != RUNNABLE) continue;
+  struct proc *p = NULL;
 
-    if(p_i->priority <= 7){
-      high_queue[high_index++] = p_i;
-    }else if (p_i->priority > 7 && p_i->priority <= 14){
-      mid_queue[mid_index++] = p_i;
-    }else{
-      low_queue[low_index++] = p_i;
-    }
+  acquire(&rq_lock);
+	struct priority_queue* queue = active->actual_queue;
+	if (queue == NULL) {
+		rq_exchange();
+		queue = active->actual_queue;
+		if (queue == NULL) {
+      goto out;
+		}
+	}
+	while (queue != NULL && queue->pos > queue->last) {
+		priority_queue_set_next();
+    queue = active->actual_queue;
+	}
+
+  if(queue != NULL) {
+    p = queue->procs[queue->pos % NPROC];
+    (queue->pos)++;
   }
 
-  if(high_index > 0){
-    return high_queue[random(high_index)];
-  }else if (mid_index > 0){
-    return mid_queue[random(mid_index)];
-  }else if (low_index > 0){
-    return low_queue[random(low_index)];
-  }
-
-  return 0;
+out:
+  release(&rq_lock);
+  return p;
 }
-#endif
 
-#ifdef DML
-// Find the next process process to run
-struct proc *ready_process() {
-  struct proc *p_i, **pp_i; 
-  struct proc *high_queue[NPROC], *mid_queue[NPROC], *low_queue[NPROC];
-  int high_index = 0, mid_index = 0, low_index = 0;
-  
-  for(p_i = proc; p_i < &proc[NPROC]; p_i++){
-    if(p_i->state != RUNNABLE) continue;
-
-    if(p_i->priority <= 7){
-      high_queue[high_index++] = p_i;
-    }else if (p_i->priority > 7 && p_i->priority <= 14){
-      mid_queue[mid_index++] = p_i;
-    }else{
-      low_queue[low_index++] = p_i;
-    }
-  }
-
-  if(high_index > 0){
-    return high_queue[random(high_index)];
-  }else if (mid_index > 0){
-    return mid_queue[random(mid_index)];
-  }else if (low_index > 0){
-    return low_queue[random(low_index)];
-  }
-
-  return 0;
+// Called from the timer interrupt handler to charge one tick to the current 
+// process. user_tick is 1 if the tick is user time, 0 for system.
+void
+update_process_times(int user_tick)
+{
+  scheduler_tick();
 }
-#endif
+
+void
+scheduler_tick(void)
+{
+  struct proc *p = myproc();
+  acquire(&p->lock);
+  p->time_slice -= 1;
+  if (p->time_slice != 0)
+    goto out;
+  p->state = RUNNABLE;
+  p->time_slice = 1000;//proc_timeslice(p);
+  proc->priority = proc_effective_priority(p);
+  #ifdef SCHED_MQS
+  rq_insert_expired(p);
+  #endif
+  sched();
+
+out:
+  release(&p->lock);
+}
+
+int
+proc_effective_priority(struct proc *p)
+{
+  return MAX(0, MIN(p->static_priority - p->sleep_avg / 10 + 5, 39));
+}
+
+uint
+proc_timeslice(struct proc *p)
+{
+  if (p->static_priority < 20)
+    return (40 - p->static_priority) * 20;
+  else
+    return (40 - p->static_priority) * 5;
+}
+
+int
+proc_interactive(struct proc *p)
+{
+  return p->priority <= (3 * p->static_priority/4 + 7);
+}
