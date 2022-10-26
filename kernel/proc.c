@@ -140,9 +140,8 @@ found:
 
   p->sleep_avg = 0;
   p->time_slice = 5;
-  p->priority = 10;
-  p->static_priority = 10;
-	p->ncicle = 0;
+  p->priority = p->static_priority = 20;
+  p->timestamp = sched_clock();
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -506,7 +505,7 @@ scheduler(void)
 void
 scheduler(void)
 {
-  struct proc *p;
+  struct proc *next, *prev;
   struct cpu *c = mycpu();
   
   c->proc = 0;
@@ -514,24 +513,41 @@ scheduler(void)
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
 
-    p = rq_get_next();
-    if (p != NULL)
+    next = rq_get_next();
+    if (next != NULL)
     {
-      acquire(&p->lock);
+      acquire(&next->lock);
+
+      uint now = sched_clock();
+      prev = myproc();
+      if (prev != NULL) {
+        acquire(&prev->lock);
+        uint run_time = now - prev->timestamp;
+        if (run_time > MAX_SLEEP_AVG)
+          run_time = MAX_SLEEP_AVG;
+
+        prev->sleep_avg -= run_time;
+        if ((int)prev->sleep_avg <= 0)
+          prev->sleep_avg = 0;
+        prev->timestamp = now;
+        release(&prev->lock);
+      }
+
+      next->timestamp = now;
 
       // Switch to chosen process.  It is the process's job
       // to release its lock and then reacquire it
       // before jumping back to us.
-      p->state = RUNNING;
-      c->proc = p;
+      next->state = RUNNING;
+      c->proc = next;
 
-      swtch(&c->context, &p->context);
+      swtch(&c->context, &next->context);
 
       // Process is done running for now.
       // It should have changed its p->state before coming back.
       c->proc = 0;
       //acquire(&schedlock);
-      release(&p->lock);
+      release(&next->lock);
     }
     //release(&schedlock);
   }
@@ -621,6 +637,8 @@ sleep(void *chan, struct spinlock *lk)
   p->chan = chan;
   p->state = SLEEPING;
 
+  p->timestamp = sched_clock();
+
   sched();
 
   // Tidy up.
@@ -643,6 +661,10 @@ wakeup(void *chan)
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
         p->state = RUNNABLE;
+
+        uint now = sched_clock();
+        p->priority = recalc_task_prio(p, now);
+        p->timestamp = now;
         #ifdef SCHED_MQS
         rq_insert_expired(p);
         #endif
@@ -890,7 +912,7 @@ rq_insert_active(struct proc *proc)
 //  As insertActive, but it inserts proc in ACTIVE or EXPIRED queue.
 //
 // ***: In this function it could be implemented a policy
-// of re-insertion of proc   in ACTIVE queue in spite of EXPIRED one.
+// of re-insertion of proc in ACTIVE queue in spite of EXPIRED one.
 // Inserting in ACTIVE means to give more exec time to a process.
 int
 rq_insert_expired(struct proc* proc)
@@ -901,8 +923,7 @@ rq_insert_expired(struct proc* proc)
 	 * priority == 1  --> reinsert 1 time in 2
  	 * priority == 10 -->  reinsert 1 time in 11
 	 */
-	int cicle = (proc->ncicle)++;
-	if ((cicle % (proc->priority + 1)) == 0)
+	if (proc_interactive(proc))
 		return rq_insert_runnable(proc, active);
 	return rq_insert_runnable(proc, expired);
 }
@@ -983,37 +1004,52 @@ scheduler_tick(void)
   struct proc *p = myproc();
   acquire(&p->lock);
   p->time_slice -= 1;
-  if (p->time_slice != 0)
-    goto out;
   p->state = RUNNABLE;
-  p->time_slice = 1000;//proc_timeslice(p);
-  proc->priority = proc_effective_priority(p);
+  if (p->time_slice == 0) {
+    p->time_slice = proc_timeslice(p);
+    p->priority = proc_effective_priority(p); 
+  }
   #ifdef SCHED_MQS
   rq_insert_expired(p);
   #endif
   sched();
-
-out:
   release(&p->lock);
 }
 
 int
 proc_effective_priority(struct proc *p)
-{
-  return MAX(0, MIN(p->static_priority - p->sleep_avg / 10 + 5, 39));
+{ 
+  return MAX(0, MIN(p->static_priority - p->sleep_avg + 5, 39));
 }
 
 uint
 proc_timeslice(struct proc *p)
 {
   if (p->static_priority < 20)
-    return (40 - p->static_priority) * 20;
+    return (40 - p->static_priority) * 2;
   else
-    return (40 - p->static_priority) * 5;
+    return (40 - p->static_priority);
 }
 
 int
 proc_interactive(struct proc *p)
 {
   return p->priority <= (3 * p->static_priority/4 + 7);
+}
+
+// See https://elixir.bootlin.com/linux/v2.6.21/source/kernel/sched.c#L64
+uint
+sched_clock(void)
+{
+  return ticks;
+}
+
+int
+recalc_task_prio(struct proc *p, uint now)
+{
+  uint sleep_time = now - p->timestamp;
+  p->sleep_avg += sleep_time;
+  if (p->sleep_avg > MAX_SLEEP_AVG)
+    p->sleep_avg = MAX_SLEEP_AVG;
+  return proc_effective_priority(p);
 }

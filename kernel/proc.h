@@ -92,11 +92,12 @@ struct proc {
   int xstate;                  // Exit status to be returned to parent's wait
   int pid;                     // Process ID
 
-  uint sleep_avg;              // Average sleep time
+  uint sleep_avg;              // Sleep time in the last second
+  uint timestamp;              // Timestamp for sleep time counting
+
   uint time_slice;             // Time to quantum expiration
   int priority;                // Dynamic prioriry
   int static_priority;         // Static priotiry
-  int ncicle;                  // Counter of resheduling
 
   // wait_lock must be held when using this:
   struct proc *parent;         // Parent process
@@ -134,7 +135,11 @@ struct procps_status {
 #endif
 
 #ifndef MIN
-#define MIN(a,b) ((a)<(b) ? (a):(b))
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#endif
+
+#ifndef MAX_SLEEP_AVG
+#define MAX_SLEEP_AVG 10
 #endif
 
 struct priority_queue {
@@ -145,16 +150,18 @@ struct priority_queue {
 	int priority;                 // priority attached to queue
 };
 
-
 struct rq {
 	char bitmap[MAX_PRIO];
 	struct priority_queue queue[MAX_PRIO][1];
 	struct priority_queue *actual_queue;
 };
 
+uint sched_clock(void);
+
 // See https://elixir.bootlin.com/linux/v2.6.21/source/kernel/timer.c#L1206
 void update_process_times(int user_tick);
 void scheduler_tick(void);
+int recalc_task_prio(struct proc *p, uint now);
 
 int proc_effective_priority(struct proc *proc);
 uint proc_timeslice(struct proc *proc);
