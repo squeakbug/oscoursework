@@ -171,6 +171,7 @@ struct rq* rq_init(struct rq *queue);
 int rq_insert_runnable(struct proc *proc, struct rq *rq);
 int rq_insert_active(struct proc *proc);
 int rq_insert_expired(struct proc *proc);
+int rq_reinsert(struct proc *p);
 int rq_exchange();
 struct proc* rq_get_next();
 

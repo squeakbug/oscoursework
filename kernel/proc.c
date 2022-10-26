@@ -546,10 +546,8 @@ scheduler(void)
       // Process is done running for now.
       // It should have changed its p->state before coming back.
       c->proc = 0;
-      //acquire(&schedlock);
       release(&next->lock);
     }
-    //release(&schedlock);
   }
 }
 #endif
@@ -666,7 +664,7 @@ wakeup(void *chan)
         p->priority = recalc_task_prio(p, now);
         p->timestamp = now;
         #ifdef SCHED_MQS
-        rq_insert_expired(p);
+        rq_reinsert(p);
         #endif
       }
       release(&p->lock);
@@ -928,6 +926,23 @@ rq_insert_expired(struct proc* proc)
 	return rq_insert_runnable(proc, expired);
 }
 
+// Dummy inplementation for reinsertion functionality
+int
+rq_reinsert(struct proc *p)
+{
+  if (p->state != RUNNABLE) {
+		return -1;
+	}
+  acquire(&rq_lock);
+	int priority = p->priority;
+	struct priority_queue *queue = priority_queue_get(active, priority);
+
+	queue->pos--;
+	queue->procs[(queue->pos + NPROC) % NPROC] = p;
+  release(&rq_lock);
+	return 1;
+}
+
 // Exchange active container with expired
 int
 rq_exchange()
@@ -981,7 +996,7 @@ rq_get_next()
 	}
 
   if(queue != NULL) {
-    p = queue->procs[queue->pos % NPROC];
+    p = queue->procs[(queue->pos + NPROC) % NPROC];
     (queue->pos)++;
   }
 
