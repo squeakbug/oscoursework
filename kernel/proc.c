@@ -143,6 +143,8 @@ found:
   p->priority = p->static_priority = 20;
   p->timestamp = sched_clock();
 
+  p->total_running = p->total_sleep = p->total_waiting = 0;
+
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
@@ -385,6 +387,8 @@ exit(int status)
     }
   }
 
+  p->total_running += sched_clock() - p->timestamp;
+
   begin_op();
   iput(p->cwd);
   end_op();
@@ -459,6 +463,40 @@ wait(uint64 addr)
   }
 }
 
+int
+wait_ptable(uint64 addr, int size, uint64 ptable_addr)
+{
+  struct proc *p;
+  struct proc *p_src;
+  struct proc *pp;
+  struct procps_status ptable;
+
+  p = myproc();
+
+  int found_zombie = 0;
+  while (!found_zombie) {
+    for (pp = proc; !found_zombie && pp < &proc[NPROC]; pp++) {
+      if (pp->parent == p) {
+        acquire(&pp->lock);
+        if (pp->state == ZOMBIE) {
+          p_src = pp;
+          found_zombie = 1;
+        }
+        release(&pp->lock);
+      }
+    }
+  }
+
+  if (p_src == NULL)
+    return -1;
+
+  fill_ptable(&ptable, p_src);
+  if (copyout(p->pagetable, ptable_addr, (char *)&ptable, sizeof(ptable)) < 0)
+    return -1;
+
+  return wait(addr);
+}
+
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
 // Scheduler never returns.  It loops, doing:
@@ -470,7 +508,7 @@ wait(uint64 addr)
 void
 scheduler(void)
 {
-  struct proc *p;
+  struct proc *p, *prev;
   struct cpu *c = mycpu();
 
   c->proc = 0;
@@ -483,6 +521,25 @@ scheduler(void)
       acquire(&p->lock);
       if (p->state == RUNNABLE)
       {
+        uint now = sched_clock();
+        prev = myproc();
+        if (prev != NULL) {
+          acquire(&prev->lock);
+          uint run_time = now - prev->timestamp;
+          prev->total_running += run_time;
+          if (run_time > MAX_SLEEP_AVG)
+            run_time = MAX_SLEEP_AVG;
+
+          prev->sleep_avg -= run_time;
+          if ((int)prev->sleep_avg <= 0)
+            prev->sleep_avg = 0;
+          prev->timestamp = now;
+          release(&prev->lock);
+        }
+
+        p->total_waiting += now - p->timestamp;
+        p->timestamp = now;
+
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
@@ -523,6 +580,7 @@ scheduler(void)
       if (prev != NULL) {
         acquire(&prev->lock);
         uint run_time = now - prev->timestamp;
+        prev->total_running += run_time;
         if (run_time > MAX_SLEEP_AVG)
           run_time = MAX_SLEEP_AVG;
 
@@ -533,6 +591,7 @@ scheduler(void)
         release(&prev->lock);
       }
 
+      next->total_waiting += now - next->timestamp;
       next->timestamp = now;
 
       // Switch to chosen process.  It is the process's job
@@ -573,6 +632,10 @@ sched(void)
     panic("sched running");
   if(intr_get())
     panic("sched interruptible");
+
+  uint now = sched_clock();
+  p->total_running += now - p->timestamp; 
+  p->timestamp = now;
 
   intena = mycpu()->intena;
   swtch(&p->context, &mycpu()->context);
@@ -635,8 +698,6 @@ sleep(void *chan, struct spinlock *lk)
   p->chan = chan;
   p->state = SLEEPING;
 
-  p->timestamp = sched_clock();
-
   sched();
 
   // Tidy up.
@@ -661,6 +722,7 @@ wakeup(void *chan)
         p->state = RUNNABLE;
 
         uint now = sched_clock();
+        p->total_sleep += now - p->timestamp;
         p->priority = recalc_task_prio(p, now);
         p->timestamp = now;
         #ifdef SCHED_MQS
@@ -1067,4 +1129,42 @@ recalc_task_prio(struct proc *p, uint now)
   if (p->sleep_avg > MAX_SLEEP_AVG)
     p->sleep_avg = MAX_SLEEP_AVG;
   return proc_effective_priority(p);
+}
+
+int
+getptable(int id, int size, void *buffer)
+{
+	struct proc *p_src;
+	struct procps_status *p_dst;
+  struct proc *p;
+
+  p_src = NULL;
+	p_dst = (struct procps_status*) buffer;
+
+	for (p = proc; p < &proc[NPROC]; p++) {
+		if (p->pid == id)
+      p_src = p;
+  }
+
+  if (p_src == NULL)
+    return -1;
+
+  fill_ptable(p_dst, p_src);
+
+	return 0;
+}
+
+void
+fill_ptable(struct procps_status *p_dst, struct proc *p_src)
+{
+  p_dst->sz = p_src->sz;
+  p_dst->state = p_src->state;
+  p_dst->pid = p_src->pid;
+  p_dst->total_sleep = p_src->total_sleep;
+  p_dst->total_running = p_src->total_running;
+  p_dst->total_waiting = p_src->total_waiting;
+  p_dst->time_slice = p_src->time_slice;
+  p_dst->priority = p_src->priority;
+  p_dst->static_priority = p_src->static_priority;
+  memmove(p_dst->name, p_src->name, 16);
 }

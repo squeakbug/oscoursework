@@ -38,3 +38,5 @@ entry("sleep");
 entry("uptime");
 entry("setpriority");
 entry("getpriority");
+entry("getptable");
+entry("wait_ptable");

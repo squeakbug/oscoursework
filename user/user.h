@@ -1,4 +1,5 @@
 struct stat;
+struct procps_status;
 
 // system calls
 int fork(void);
@@ -24,6 +25,8 @@ int sleep(int);
 int uptime(void);
 int setpriority(int, int);
 int getpriority(int);
+int getptable(int, int, void*);
+int wait_ptable(int*, int, void*);
 
 // ulib.c
 int stat(const char*, struct stat*);

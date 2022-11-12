@@ -108,6 +108,8 @@ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
 int             setpriority();
 int             getpriority();
+int             getptable(int id, int size, void *buffer);
+int             wait_ptable(uint64 addr, int size, uint64 buffer);
 
 #define SCHED_MQS
 

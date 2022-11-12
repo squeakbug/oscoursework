@@ -22,3 +22,5 @@
 #define SYS_close  21
 #define SYS_setpriority  22
 #define SYS_getpriority  23
+#define SYS_getptable 24
+#define SYS_wait_ptable 25

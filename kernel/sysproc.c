@@ -109,3 +109,39 @@ sys_getpriority(void)
   argint(0, &pid);
   return getpriority(pid);
 }
+
+uint64
+sys_getptable(void)
+{
+  int pid;
+  int size;
+  uint64 buffer;
+
+  argint(0, &pid);
+  argint(1, &size);
+  argaddr(2, &buffer);
+
+  if (size != sizeof(struct procps_status)) {
+    return -1;
+  }
+
+  return getptable(pid, size, &buffer);
+}
+
+uint64
+sys_wait_ptable(void)
+{
+  uint64 p;
+  int size;
+  uint64 buffer;
+
+  argaddr(0, &p);
+  argint(1, &size);
+  argaddr(2, &buffer);
+
+  if (size != sizeof(struct procps_status)) {
+    return -1;
+  }
+
+  return wait_ptable(p, size, buffer);
+}

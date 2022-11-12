@@ -134,6 +134,7 @@ UPROGS=\
 	$U/_zombie\
 	$U/_nice\
 	$U/_test_scheduler\
+	$U/_test_global_sched
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

@@ -17,8 +17,6 @@ int main(int argc, char *argv[]) {
   nprocess = atoi(argv[1]);
   steps = atoi(argv[2]);
 
-  printf("usage: %s <nsubprocess> <nsteps>\n", argv[0]);
-
   for (k = 0; k < nprocess; k++) {
     pid = fork ();
     if (pid < 0) {

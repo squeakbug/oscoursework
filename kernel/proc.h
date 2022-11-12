@@ -1,3 +1,5 @@
+#include "proc_us.h"
+
 // Saved registers for kernel context switches.
 struct context {
   uint64 ra;
@@ -79,8 +81,6 @@ struct trapframe {
   /* 280 */ uint64 t6;
 };
 
-enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
-
 // Per-process state
 struct proc {
   struct spinlock lock;
@@ -94,6 +94,10 @@ struct proc {
 
   uint sleep_avg;              // Sleep time in the last second
   uint timestamp;              // Timestamp for sleep time counting
+
+  uint total_sleep;
+  uint total_running;
+  uint total_waiting;
 
   uint time_slice;             // Time to quantum expiration
   int priority;                // Dynamic prioriry
@@ -111,15 +115,6 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
-};
-
-struct procps_status {
-  uint sz;                     // Size of process memory (bytes)
-  enum procstate state;        // Process state
-  int pid;                     // Process ID
-  int ppid ;                   // Parent process ID
-  int priority;                // Process priority
-  char name[16];               // Process name 
 };
 
 #ifndef MAX_PRIO
@@ -179,3 +174,6 @@ int priority_queue_init(struct priority_queue *queue, int priority);
 struct priority_queue* priority_queue_get(struct rq *rq,	int priority);
 int priotiry_queue_add_proc(struct proc *proc, struct priority_queue *queue);
 int priority_queue_set_next();
+
+int getptable(int id, int size, void *buffer);
+void fill_ptable(struct procps_status *p_dst, struct proc *p_src);
