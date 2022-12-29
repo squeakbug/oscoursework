@@ -19,11 +19,11 @@ void routine(int steps)
 void routine_file(int steps)
 {
     int z;
-    char data[256] = "hell_world";
+    char data[64] = "hell_world";
 
     for (z = 0; z < steps; z += 1) {
         int fd = open("test.txt", O_CREATE | O_WRONLY);
-        write(fd, data, sizeof(char) * 256);
+        write(fd, data, sizeof(char) * 64);
         close(fd);
     }
 }
@@ -51,7 +51,17 @@ int main(int argc, char *argv[]) {
 
   printf("%s\t%s\t%s\t%s\n", "pid", "running", "sleep", "waiting");
   for (r = 0; r < runs; ++r) {
-    for (k = 0; k < nprocess; k++) {
+    int mid = nprocess / 2;
+    for (k = 0; k < mid; k++) {
+      pid = fork ();
+      if (pid < 0) {
+        printf("%d failed in fork!\n", getpid());
+        exit(1);
+      } else if (pid == 0) {
+        routine_file(steps);
+        exit(1);
+      }
+
       pid = fork ();
       if (pid < 0) {
         printf("%d failed in fork!\n", getpid());
