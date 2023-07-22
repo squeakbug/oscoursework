@@ -1,0 +1,1122 @@
+diff --git a/.gitignore b/.gitignore
+index 07216f3..49d7d79 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -15,3 +15,4 @@ mkfs
+ kernel/kernel
+ user/usys.S
+ .gdbinit
++.vscode/
+\ No newline at end of file
+diff --git a/Makefile b/Makefile
+index 39a99d7..14c8610 100644
+--- a/Makefile
++++ b/Makefile
+@@ -132,6 +132,9 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_nice\
++	$U/_test_scheduler\
++	$U/_test_global_sched
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..bf00df0 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -106,6 +106,12 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++int             setpriority();
++int             getpriority();
++int             getptable(int id, int size, void *buffer);
++int             wait_ptable(uint64 addr, int size, uint64 buffer);
++
++#define SCHED_MQS
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+diff --git a/kernel/param.h b/kernel/param.h
+index 6624bff..daec18c 100644
+--- a/kernel/param.h
++++ b/kernel/param.h
+@@ -1,4 +1,4 @@
+-#define NPROC        64  // maximum number of processes
++#define NPROC       256  // maximum number of processes
+ #define NCPU          8  // maximum number of CPUs
+ #define NOFILE       16  // open files per process
+ #define NFILE       100  // open files per system
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 959b778..c62f0b7 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -26,6 +26,11 @@ extern char trampoline[]; // trampoline.S
+ // must be acquired before any p->lock.
+ struct spinlock wait_lock;
+ 
++struct spinlock rq_lock;
++struct rq *expired, *active;
++struct rq expired_d, active_d;
++
++
+ // Allocate a page for each process's kernel stack.
+ // Map it high in memory, followed by an invalid
+ // guard page.
+@@ -56,6 +61,14 @@ procinit(void)
+       p->state = UNUSED;
+       p->kstack = KSTACK((int) (p - proc));
+   }
++
++  #ifdef SCHED_MQS
++  initlock(&rq_lock, "rq_lock");
++  active = &active_d;
++  rq_init(active);
++  expired = &expired_d;
++  rq_init(expired);
++  #endif
+ }
+ 
+ // Must be called with interrupts disabled,
+@@ -125,6 +138,13 @@ found:
+   p->pid = allocpid();
+   p->state = USED;
+ 
++  p->sleep_avg = 0;
++  p->time_slice = 5;
++  p->priority = p->static_priority = 20;
++  p->timestamp = sched_clock();
++
++  p->total_running = p->total_sleep = p->total_waiting = 0;
++
+   // Allocate a trapframe page.
+   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+     freeproc(p);
+@@ -251,6 +271,10 @@ userinit(void)
+ 
+   p->state = RUNNABLE;
+ 
++  #ifdef SCHED_MQS
++  rq_insert_active(p);
++  #endif
++
+   release(&p->lock);
+ }
+ 
+@@ -320,6 +344,9 @@ fork(void)
+ 
+   acquire(&np->lock);
+   np->state = RUNNABLE;
++  #ifdef SCHED_MQS
++  rq_insert_active(np);
++  #endif
+   release(&np->lock);
+ 
+   return pid;
+@@ -360,6 +387,8 @@ exit(int status)
+     }
+   }
+ 
++  p->total_running += sched_clock() - p->timestamp;
++
+   begin_op();
+   iput(p->cwd);
+   end_op();
+@@ -434,6 +463,40 @@ wait(uint64 addr)
+   }
+ }
+ 
++int
++wait_ptable(uint64 addr, int size, uint64 ptable_addr)
++{
++  struct proc *p;
++  struct proc *p_src;
++  struct proc *pp;
++  struct procps_status ptable;
++
++  p = myproc();
++
++  int found_zombie = 0;
++  while (!found_zombie) {
++    for (pp = proc; !found_zombie && pp < &proc[NPROC]; pp++) {
++      if (pp->parent == p) {
++        acquire(&pp->lock);
++        if (pp->state == ZOMBIE) {
++          p_src = pp;
++          found_zombie = 1;
++        }
++        release(&pp->lock);
++      }
++    }
++  }
++
++  if (p_src == NULL)
++    return -1;
++
++  fill_ptable(&ptable, p_src);
++  if (copyout(p->pagetable, ptable_addr, (char *)&ptable, sizeof(ptable)) < 0)
++    return -1;
++
++  return wait(addr);
++}
++
+ // Per-CPU process scheduler.
+ // Each CPU calls scheduler() after setting itself up.
+ // Scheduler never returns.  It loops, doing:
+@@ -441,25 +504,48 @@ wait(uint64 addr)
+ //  - swtch to start running that process.
+ //  - eventually that process transfers control
+ //    via swtch back to the scheduler.
++#ifdef SCHED_DEFAULT
+ void
+ scheduler(void)
+ {
+-  struct proc *p;
++  struct proc *p, *prev;
+   struct cpu *c = mycpu();
+-  
++
+   c->proc = 0;
+   for(;;){
+     // Avoid deadlock by ensuring that devices can interrupt.
+     intr_on();
+ 
+-    for(p = proc; p < &proc[NPROC]; p++) {
++    for (p = proc; p < &proc[NPROC]; p++)
++    {
+       acquire(&p->lock);
+-      if(p->state == RUNNABLE) {
++      if (p->state == RUNNABLE)
++      {
++        uint now = sched_clock();
++        prev = myproc();
++        if (prev != NULL) {
++          acquire(&prev->lock);
++          uint run_time = now - prev->timestamp;
++          prev->total_running += run_time;
++          if (run_time > MAX_SLEEP_AVG)
++            run_time = MAX_SLEEP_AVG;
++
++          prev->sleep_avg -= run_time;
++          if ((int)prev->sleep_avg <= 0)
++            prev->sleep_avg = 0;
++          prev->timestamp = now;
++          release(&prev->lock);
++        }
++
++        p->total_waiting += now - p->timestamp;
++        p->timestamp = now;
++
+         // Switch to chosen process.  It is the process's job
+         // to release its lock and then reacquire it
+         // before jumping back to us.
+         p->state = RUNNING;
+         c->proc = p;
++
+         swtch(&c->context, &p->context);
+ 
+         // Process is done running for now.
+@@ -470,6 +556,60 @@ scheduler(void)
+     }
+   }
+ }
++#endif
++
++#ifdef SCHED_MQS
++void
++scheduler(void)
++{
++  struct proc *next, *prev;
++  struct cpu *c = mycpu();
++  
++  c->proc = 0;
++  for(;;){
++    // Avoid deadlock by ensuring that devices can interrupt.
++    intr_on();
++
++    next = rq_get_next();
++    if (next != NULL)
++    {
++      acquire(&next->lock);
++
++      uint now = sched_clock();
++      prev = myproc();
++      if (prev != NULL) {
++        acquire(&prev->lock);
++        uint run_time = now - prev->timestamp;
++        prev->total_running += run_time;
++        if (run_time > MAX_SLEEP_AVG)
++          run_time = MAX_SLEEP_AVG;
++
++        prev->sleep_avg -= run_time;
++        if ((int)prev->sleep_avg <= 0)
++          prev->sleep_avg = 0;
++        prev->timestamp = now;
++        release(&prev->lock);
++      }
++
++      next->total_waiting += now - next->timestamp;
++      next->timestamp = now;
++
++      // Switch to chosen process.  It is the process's job
++      // to release its lock and then reacquire it
++      // before jumping back to us.
++      next->state = RUNNING;
++      c->proc = next;
++
++      swtch(&c->context, &next->context);
++
++      // Process is done running for now.
++      // It should have changed its p->state before coming back.
++      c->proc = 0;
++      release(&next->lock);
++    }
++  }
++}
++#endif
+ 
+ // Switch to scheduler.  Must hold only p->lock
+ // and have changed proc->state. Saves and restores
+@@ -493,6 +633,10 @@ sched(void)
+   if(intr_get())
+     panic("sched interruptible");
+ 
++  uint now = sched_clock();
++  p->total_running += now - p->timestamp; 
++  p->timestamp = now;
++
+   intena = mycpu()->intena;
+   swtch(&p->context, &mycpu()->context);
+   mycpu()->intena = intena;
+@@ -505,6 +649,9 @@ yield(void)
+   struct proc *p = myproc();
+   acquire(&p->lock);
+   p->state = RUNNABLE;
++  #ifdef SCHED_MQS
++  rq_insert_expired(p);
++  #endif  
+   sched();
+   release(&p->lock);
+ }
+@@ -573,6 +720,14 @@ wakeup(void *chan)
+       acquire(&p->lock);
+       if(p->state == SLEEPING && p->chan == chan) {
+         p->state = RUNNABLE;
++
++        uint now = sched_clock();
++        p->total_sleep += now - p->timestamp;
++        p->priority = recalc_task_prio(p, now);
++        p->timestamp = now;
++        #ifdef SCHED_MQS
++        rq_reinsert(p);
++        #endif
+       }
+       release(&p->lock);
+     }
+@@ -594,6 +749,9 @@ kill(int pid)
+       if(p->state == SLEEPING){
+         // Wake process from sleep().
+         p->state = RUNNABLE;
++        #ifdef SCHED_MQS
++        rq_insert_expired(p);
++        #endif
+       }
+       release(&p->lock);
+       return 0;
+@@ -681,3 +839,332 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++// Set process priority
++int
++setpriority(int pid, int priority)
++{
++  if (priority < 0 || priority > MAX_PRIO)
++    return -1;
++
++  struct proc *p;
++  int is_finded = 0;
++
++  for(p = proc; is_finded == 0 && p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if(p->pid == pid) {
++      p->priority = priority;
++      is_finded = 1;
++    }
++    release(&p->lock);
++  }
++  return is_finded - 1;
++}
++
++// Get process priority
++int
++getpriority(int pid)
++{
++  struct proc *p;
++
++  for(p = proc; p < &proc[NPROC]; p++) {
++    if(p->pid == pid) {
++      return p->priority;
++    }
++  }
++  return -1;
++}
++
++// Initialize runqueue
++struct rq*
++rq_init(struct rq *queue)
++{
++	for (int i = 0; i < MAX_PRIO; i++) {
++		queue->bitmap[i] = 0;
++	}
++	queue->actual_queue = NULL;
++	return queue;
++}
++
++// Initialize and clean a queue
++int
++priority_queue_init(struct priority_queue *queue, int priority)
++{
++	queue->next = NULL;
++	queue->last = -1;
++	queue->pos = 0;
++	queue->priority = priority;
++	return 1;
++}
++
++// Get the priority_queue of a specific priority in the
++// specified rq.
++// If it does not exists then it will be created.
++struct priority_queue*
++priority_queue_get(struct rq *rq,	int priority)
++{
++	if (rq->bitmap[priority]) {
++		return rq->queue[priority];
++	}
++
++	struct priority_queue *new = rq->queue[priority];
++	priority_queue_init(new, priority);
++
++	rq->bitmap[priority] = 1;
++
++	if (rq->actual_queue == NULL || rq->actual_queue->priority > priority) {
++		new->next = rq->actual_queue;
++		rq->actual_queue = new;
++		return new;
++	}
++	// else
++	struct priority_queue *before = rq->actual_queue;
++	for (int i = priority - 1; i >= 0; i--) {
++		if (rq->bitmap[i]) {
++			before = rq->queue[i];
++			break;
++		}
++	}
++	new->next = before->next;
++	before->next = new;
++
++	return new;
++}
++
++// Insert the proc in the specified priority_queue
++// and update info of the priority_queue
++int
++priotiry_queue_add_proc(struct proc *proc, struct priority_queue *queue)
++{
++	queue->last++;
++	queue->procs[queue->last % NPROC] = proc;
++	return 0;
++}
++
++// Inserts proc in the specified rq
++// in the right position.
++int
++rq_insert_runnable(struct proc *proc, struct rq *rq)
++{
++	if (proc->state != RUNNABLE) {
++		return -1;
++	}
++  acquire(&rq_lock);
++	int priority = proc->priority;
++	struct priority_queue *queue = priority_queue_get(rq, priority);
++
++	priotiry_queue_add_proc(proc, queue);
++  release(&rq_lock);
++	return 1;
++}
++
++// If proc is RUNNABLE the funcion inserts it in the ACTIVE queue of processes
++// proc: process to be inserted in the 'queue' of execution
++//
++// Returns: 1 if succesfully inserted, otherwise -1
++// ***: This function should be called only at the creation of a proces
++int
++rq_insert_active(struct proc *proc)
++{
++	return rq_insert_runnable(proc, active);
++}
++
++//  As insertActive, but it inserts proc in ACTIVE or EXPIRED queue.
++//
++// ***: In this function it could be implemented a policy
++// of re-insertion of proc in ACTIVE queue in spite of EXPIRED one.
++// Inserting in ACTIVE means to give more exec time to a process.
++int
++rq_insert_expired(struct proc* proc)
++{
++  
++	/* My default policy is to reinstert a proces in ACTIVE
++	 * 1 time over the priority(+1) of the process
++	 * priority == 1  --> reinsert 1 time in 2
++ 	 * priority == 10 -->  reinsert 1 time in 11
++	 */
++	if (proc_interactive(proc))
++		return rq_insert_runnable(proc, active);
++	return rq_insert_runnable(proc, expired);
++}
++
++// Dummy inplementation for reinsertion functionality
++int
++rq_reinsert(struct proc *p)
++{
++  if (p->state != RUNNABLE) {
++		return -1;
++	}
++  acquire(&rq_lock);
++	int priority = p->priority;
++	struct priority_queue *queue = priority_queue_get(active, priority);
++
++	queue->pos--;
++	queue->procs[(queue->pos + NPROC) % NPROC] = p;
++  release(&rq_lock);
++	return 1;
++}
++
++// Exchange active container with expired
++int
++rq_exchange()
++{
++	struct rq *tmp = expired;
++	expired = active;
++	active = tmp;
++	return 0;
++}
++
++// Move actual_queue of ACTIVE container to the next priority_queue
++// setting all the necessary
++int
++priority_queue_set_next()
++{
++	struct priority_queue* queue = active->actual_queue;
++	struct priority_queue* next = queue->next;
++	int priority = active->actual_queue->priority;
++	active->bitmap[priority] = 0;
++
++	active->actual_queue = next;
++	if (next != NULL) {
++		return 0;
++	} else {
++		return rq_exchange();
++	}
++}
++
++// Find and returns the process that belongs to the queue
++// with the lowest priority among the valid ones
++// and that has been inserted before all processes
++// not yet extracted from its priority_queue.
++// If needed it exchange rq
++struct proc *
++rq_get_next()
++{
++  struct proc *p = NULL;
++
++  acquire(&rq_lock);
++	struct priority_queue* queue = active->actual_queue;
++	if (queue == NULL) {
++		rq_exchange();
++		queue = active->actual_queue;
++		if (queue == NULL) {
++      goto out;
++		}
++	}
++	while (queue != NULL && queue->pos > queue->last) {
++		priority_queue_set_next();
++    queue = active->actual_queue;
++	}
++
++  if(queue != NULL) {
++    p = queue->procs[(queue->pos + NPROC) % NPROC];
++    (queue->pos)++;
++  }
++
++out:
++  release(&rq_lock);
++  return p;
++}
++
++// Called from the timer interrupt handler to charge one tick to the current 
++// process. user_tick is 1 if the tick is user time, 0 for system.
++void
++update_process_times(int user_tick)
++{
++  scheduler_tick();
++}
++
++void
++scheduler_tick(void)
++{
++  struct proc *p = myproc();
++  acquire(&p->lock);
++  p->time_slice -= 1;
++  p->state = RUNNABLE;
++  if (p->time_slice == 0) {
++    p->time_slice = proc_timeslice(p);
++    p->priority = proc_effective_priority(p); 
++  }
++  #ifdef SCHED_MQS
++  rq_insert_expired(p);
++  #endif
++  sched();
++  release(&p->lock);
++}
++
++int
++proc_effective_priority(struct proc *p)
++{ 
++  return MAX(0, MIN(p->static_priority - p->sleep_avg + 5, 39));
++}
++
++uint
++proc_timeslice(struct proc *p)
++{
++  if (p->static_priority < 20)
++    return (40 - p->static_priority) * 2;
++  else
++    return (40 - p->static_priority);
++}
++
++int
++proc_interactive(struct proc *p)
++{
++  return p->priority <= (3 * p->static_priority/4 + 7);
++}
++
++// See https://elixir.bootlin.com/linux/v2.6.21/source/kernel/sched.c#L64
++uint
++sched_clock(void)
++{
++  return ticks;
++}
++
++int
++recalc_task_prio(struct proc *p, uint now)
++{
++  uint sleep_time = now - p->timestamp;
++  p->sleep_avg += sleep_time;
++  if (p->sleep_avg > MAX_SLEEP_AVG)
++    p->sleep_avg = MAX_SLEEP_AVG;
++  return proc_effective_priority(p);
++}
++
++int
++getptable(int id, int size, void *buffer)
++{
++	struct proc *p_src;
++	struct procps_status *p_dst;
++  struct proc *p;
++
++  p_src = NULL;
++	p_dst = (struct procps_status*) buffer;
++
++	for (p = proc; p < &proc[NPROC]; p++) {
++		if (p->pid == id)
++      p_src = p;
++  }
++
++  if (p_src == NULL)
++    return -1;
++
++  fill_ptable(p_dst, p_src);
++
++	return 0;
++}
++
++void
++fill_ptable(struct procps_status *p_dst, struct proc *p_src)
++{
++  p_dst->sz = p_src->sz;
++  p_dst->state = p_src->state;
++  p_dst->pid = p_src->pid;
++  p_dst->total_sleep = p_src->total_sleep;
++  p_dst->total_running = p_src->total_running;
++  p_dst->total_waiting = p_src->total_waiting;
++  p_dst->time_slice = p_src->time_slice;
++  p_dst->priority = p_src->priority;
++  p_dst->static_priority = p_src->static_priority;
++  memmove(p_dst->name, p_src->name, 16);
++}
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..f5ba78a 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -1,3 +1,5 @@
++#include "proc_us.h"
++
+ // Saved registers for kernel context switches.
+ struct context {
+   uint64 ra;
+@@ -79,8 +81,6 @@ struct trapframe {
+   /* 280 */ uint64 t6;
+ };
+ 
+-enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+-
+ // Per-process state
+ struct proc {
+   struct spinlock lock;
+@@ -92,6 +92,17 @@ struct proc {
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
+ 
++  uint sleep_avg;              // Sleep time in the last second
++  uint timestamp;              // Timestamp for sleep time counting
++
++  uint total_sleep;
++  uint total_running;
++  uint total_waiting;
++
++  uint time_slice;             // Time to quantum expiration
++  int priority;                // Dynamic prioriry
++  int static_priority;         // Static priotiry
++
+   // wait_lock must be held when using this:
+   struct proc *parent;         // Parent process
+ 
+@@ -105,3 +116,64 @@ struct proc {
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
+ };
++
++#ifndef MAX_PRIO
++#define MAX_PRIO 40
++#endif
++
++#ifndef NULL
++#define NULL  ((void *) 0)
++#endif
++
++#ifndef MAX
++# define MAX(a, b)	(((a) > (b))? (a) : (b))
++#endif
++
++#ifndef MIN
++#define MIN(a, b) (((a) < (b)) ? (a) : (b))
++#endif
++
++#ifndef MAX_SLEEP_AVG
++#define MAX_SLEEP_AVG 10
++#endif
++
++struct priority_queue {
++	struct priority_queue *next;
++	int last;                     // index of last process in the queue
++	int pos;                      // index of current process
++	struct proc *procs[NPROC];
++	int priority;                 // priority attached to queue
++};
++
++struct rq {
++	char bitmap[MAX_PRIO];
++	struct priority_queue queue[MAX_PRIO][1];
++	struct priority_queue *actual_queue;
++};
++
++uint sched_clock(void);
++
++// See https://elixir.bootlin.com/linux/v2.6.21/source/kernel/timer.c#L1206
++void update_process_times(int user_tick);
++void scheduler_tick(void);
++int recalc_task_prio(struct proc *p, uint now);
++
++int proc_effective_priority(struct proc *proc);
++uint proc_timeslice(struct proc *proc);
++int proc_interactive(struct proc *proc);
++
++struct rq* rq_init(struct rq *queue);
++int rq_insert_runnable(struct proc *proc, struct rq *rq);
++int rq_insert_active(struct proc *proc);
++int rq_insert_expired(struct proc *proc);
++int rq_reinsert(struct proc *p);
++int rq_exchange();
++struct proc* rq_get_next();
++
++int priority_queue_init(struct priority_queue *queue, int priority);
++struct priority_queue* priority_queue_get(struct rq *rq,	int priority);
++int priotiry_queue_add_proc(struct proc *proc, struct priority_queue *queue);
++int priority_queue_set_next();
++
++int getptable(int id, int size, void *buffer);
++void fill_ptable(struct procps_status *p_dst, struct proc *p_src);
+diff --git a/kernel/proc_us.h b/kernel/proc_us.h
+new file mode 100644
+index 0000000..86a7788
+--- /dev/null
++++ b/kernel/proc_us.h
+@@ -0,0 +1,14 @@
++enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
++
++struct procps_status {
++  uint sz;
++  enum procstate state;
++  int pid;
++  uint total_sleep;
++  uint total_running;
++  uint total_waiting;
++  uint time_slice;
++  int priority;
++  int static_priority;
++  char name[16];
++};
+diff --git a/kernel/start.c b/kernel/start.c
+index e16f18a..c7769bb 100644
+--- a/kernel/start.c
++++ b/kernel/start.c
+@@ -67,6 +67,7 @@ timerinit()
+ 
+   // ask the CLINT for a timer interrupt.
+   int interval = 1000000; // cycles; about 1/10th second in qemu.
++  //int interval = 10000;
+   *(uint64*)CLINT_MTIMECMP(id) = *(uint64*)CLINT_MTIME + interval;
+ 
+   // prepare information in scratch[] for timervec.
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..4005808 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,10 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_setpriority(void);
++extern uint64 sys_getpriority(void);
++extern uint64 sys_getptable(void);
++extern uint64 sys_wait_ptable(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +130,10 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_setpriority]   sys_setpriority,
++[SYS_getpriority]   sys_getpriority,
++[SYS_getptable]     sys_getptable,
++[SYS_wait_ptable]   sys_wait_ptable,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..a85c21f 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,7 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_setpriority  22
++#define SYS_getpriority  23
++#define SYS_getptable 24
++#define SYS_wait_ptable 25
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 1de184e..a31fb6d 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -89,3 +89,59 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_setpriority(void)
++{
++  int pid;
++  int priority;
++
++  argint(0, &pid);
++  argint(1, &priority);
++  return setpriority(pid, priority);
++}
++
++uint64
++sys_getpriority(void)
++{
++  int pid;
++
++  argint(0, &pid);
++  return getpriority(pid);
++}
++
++uint64
++sys_getptable(void)
++{
++  int pid;
++  int size;
++  uint64 buffer;
++
++  argint(0, &pid);
++  argint(1, &size);
++  argaddr(2, &buffer);
++
++  if (size != sizeof(struct procps_status)) {
++    return -1;
++  }
++
++  return getptable(pid, size, &buffer);
++}
++
++uint64
++sys_wait_ptable(void)
++{
++  uint64 p;
++  int size;
++  uint64 buffer;
++
++  argaddr(0, &p);
++  argint(1, &size);
++  argaddr(2, &buffer);
++
++  if (size != sizeof(struct procps_status)) {
++    return -1;
++  }
++
++  return wait_ptable(p, size, buffer);
++}
+diff --git a/kernel/trap.c b/kernel/trap.c
+index 512c850..50075fa 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -78,7 +78,7 @@ usertrap(void)
+ 
+   // give up the CPU if this is a timer interrupt.
+   if(which_dev == 2)
+-    yield();
++    update_process_times(1);
+ 
+   usertrapret();
+ }
+@@ -152,7 +152,7 @@ kerneltrap()
+ 
+   // give up the CPU if this is a timer interrupt.
+   if(which_dev == 2 && myproc() != 0 && myproc()->state == RUNNING)
+-    yield();
++    update_process_times(0);
+ 
+   // the yield() may have caused some traps to occur,
+   // so restore trap registers for use by kernelvec.S's sepc instruction.
+diff --git a/user/nice.c b/user/nice.c
+new file mode 100644
+index 0000000..94aa74b
+--- /dev/null
++++ b/user/nice.c
+@@ -0,0 +1,24 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fs.h"
++
++int main(int argc, char *argv[])
++{
++  int priority, pid;
++
++  if (argc < 3) {
++      printf("Usage: nice pid priority\n");
++      exit(1);
++  }
++  pid = atoi(argv[1]);
++  priority = atoi(argv[2]);
++  if (priority < 0 || priority > 20) {
++      printf("Invalid priority (0-20)!\n");
++      exit(1);
++  }
++
++  setpriority(pid, priority);
++
++  exit(0);
++}
+\ No newline at end of file
+diff --git a/user/test_global_sched.c b/user/test_global_sched.c
+new file mode 100644
+index 0000000..b4bc03c
+--- /dev/null
++++ b/user/test_global_sched.c
+@@ -0,0 +1,85 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user.h"
++#include "kernel/fs.h"
++#include "kernel/fcntl.h"
++#include "kernel/proc_us.h"
++
++void routine(int steps)
++{
++    int z;
++    char buffer_src[1024], buffer_dst[1024];
++
++    for (z = 0; z < steps; z += 1) {
++        memmove(buffer_dst, buffer_src, 1024);
++        memmove(buffer_src, buffer_dst, 1024);
++    }
++}
++
++void routine_file(int steps)
++{
++    int z;
++    char data[64] = "hell_world";
++
++    for (z = 0; z < steps; z += 1) {
++        int fd = open("test.txt", O_CREATE | O_WRONLY);
++        write(fd, data, sizeof(char) * 64);
++        close(fd);
++    }
++}
++
++void output_results(struct procps_status *ptable)
++{
++  fprintf(1, "%d\t%d\t%d\t%d\n", ptable->pid, ptable->total_running,
++    ptable->total_sleep, ptable->total_waiting);
++}
++
++int main(int argc, char *argv[]) {
++  int pid;
++  int k, nprocess;
++  int steps;
++  int r, runs;
++
++  if (argc != 4) {
++    printf("usage: %s <nsubprocess> <nsteps> <runs>\n", argv[0]);
++    exit(1);
++  }
++
++  nprocess = atoi(argv[1]);
++  steps = atoi(argv[2]);
++  runs = atoi(argv[3]);
++
++  printf("%s\t%s\t%s\t%s\n", "pid", "running", "sleep", "waiting");
++  for (r = 0; r < runs; ++r) {
++    int mid = nprocess / 2;
++    for (k = 0; k < mid; k++) {
++      pid = fork ();
++      if (pid < 0) {
++        printf("%d failed in fork!\n", getpid());
++        exit(1);
++      } else if (pid == 0) {
++        routine_file(steps);
++        exit(1);
++      }
++
++      pid = fork ();
++      if (pid < 0) {
++        printf("%d failed in fork!\n", getpid());
++        exit(1);
++      } else if (pid == 0) {
++        routine(steps);
++        exit(1);
++      }
++    }
++
++    struct procps_status ptable;
++    pid = wait_ptable(0, sizeof(ptable), &ptable);
++    for (k = 1; k < nprocess; k++) {
++      output_results(&ptable);
++      pid = wait_ptable(0, sizeof(ptable), &ptable);
++    }
++    output_results(&ptable);
++  }
++
++  exit(1);
++}
+\ No newline at end of file
+diff --git a/user/test_scheduler.c b/user/test_scheduler.c
+new file mode 100644
+index 0000000..1157229
+--- /dev/null
++++ b/user/test_scheduler.c
+@@ -0,0 +1,41 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user.h"
++#include "kernel/fs.h"
++
++int main(int argc, char *argv[]) {
++  int pid;
++  int k, nprocess;
++  int z, steps;
++  char buffer_src[1024], buffer_dst[1024];
++
++  if (argc != 3) {
++    printf("usage: %s <nsubprocess> <nsteps>\n", argv[0]);
++    exit(1);
++  }
++
++  nprocess = atoi(argv[1]);
++  steps = atoi(argv[2]);
++
++  for (k = 0; k < nprocess; k++) {
++    pid = fork ();
++    if (pid < 0) {
++      printf("%d failed in fork!\n", getpid());
++      exit(1);
++    } else if (pid == 0) {  
++      printf("[pid=%d] created\n", getpid());
++      for (z = 0; z < steps; z += 1) {
++         memmove(buffer_dst, buffer_src, 1024);
++         memmove(buffer_src, buffer_dst, 1024);
++      }
++      exit(1);
++    }
++  }
++
++  for (k = 0; k < nprocess; k++) {
++    pid = wait(0);
++    printf("[pid=%d] terminated\n", pid);
++  }
++
++  exit(1);
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index 4d398d5..25eabb6 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,4 +1,5 @@
+ struct stat;
++struct procps_status;
+ 
+ // system calls
+ int fork(void);
+@@ -22,6 +23,10 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int setpriority(int, int);
++int getpriority(int);
++int getptable(int, int, void*);
++int wait_ptable(int*, int, void*);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..a4ec9c6 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,7 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("setpriority");
++entry("getpriority");
++entry("getptable");
++entry("wait_ptable");
